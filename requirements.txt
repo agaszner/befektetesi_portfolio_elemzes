@@ -1,0 +1,5 @@
+pandas
+influxdb-client
+python-dotenv
+requests
+zipfile36
