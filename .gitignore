@@ -1,0 +1,15 @@
+# Ignore InfluxDB data directories and files
+influxdb/data/
+influxdb/wal/
+influxdb/meta/
+
+# Ignore backup files
+influxdb/backup/
+influxdb/snapshot/
+
+# Ignore temporary or log files
+influxdb/logs/
+*.log
+
+# Ignore any temporary files
+*.tmp
