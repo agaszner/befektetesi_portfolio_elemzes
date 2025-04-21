@@ -104,7 +104,7 @@ class LSTMModel:
         model.compile(optimizer='adam', loss='mse', metrics=['mae'])
         return model
 
-    def fit(self, X_train, y_train, epochs=10, batch_size=32, validation_split=0.1, patience=10):
+    def fit(self, X_train, y_train, epochs=10, batch_size=32, patience=10):
         """
         Train the LSTM model with early stopping.
 
@@ -121,7 +121,7 @@ class LSTMModel:
         # Figyeli a validációs veszteséget (val_loss)
         # patience: Hány epoch-ig vár javulás nélkül, mielőtt leállna
         # restore_best_weights: Visszaállítja a legjobb súlyokat a tanítás végén
-        early_stopping = EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)
+        early_stopping = EarlyStopping(monitor='loss', patience=patience, restore_best_weights=True)
 
         # Adjuk át a callback-et a fit metódusnak a callbacks listában
         print(f"Training started with EarlyStopping (patience={patience})...")
@@ -129,8 +129,7 @@ class LSTMModel:
             X_train, 
             y_train, 
             epochs=epochs, 
-            batch_size=batch_size, 
-            validation_split=validation_split, 
+            batch_size=batch_size,
             callbacks=[early_stopping], # Itt adjuk hozzá a callback-et
             verbose=1
         )
@@ -158,11 +157,11 @@ class LSTMModel:
                     # Feltételezzük, hogy a scaler 1 feature-re lett illesztve, ha a features=1
                     # Ha több feature van, a reshape és inverse_transform logikát lehet, hogy igazítani kell
                     num_features_scaled = self.scaler.n_features_in_ if hasattr(self.scaler, 'n_features_in_') else features
-                    
+
                     # Fontos: A reshape az inverse_transform előtt illeszkedjen ahhoz, ahogy a scaler-t illesztették
                     # Gyakran (samples * steps, num_features_scaled) alakra van szükség
                     reshaped_preds = preds.reshape(-1, features)
-                    
+
                     # Ha a scaler kevesebb feature-re lett illesztve, mint a modell kimenete (ami itt 1),
                     # akkor valószínűleg csak ezt az 1 feature-t kell visszaalakítani.
                     # Ha a scaler több feature-re lett illesztve, akkor dummy adatokat kellhet hozzáadni
@@ -196,3 +195,114 @@ class LSTMModel:
                 print("Warning: Scaler does not have an inverse_transform method.")
 
         return preds
+
+    def save_model(self, filepath, save_format='tf'):
+        """
+        Save the trained model to disk.
+
+        Args:
+            filepath (str): Path where the model will be saved
+            save_format (str): Format to save the model, either 'tf' for SavedModel format
+                              or 'h5' for HDF5 format
+
+        Returns:
+            None
+
+        Example:
+            model.save_model('path/to/model', save_format='h5')
+        """
+        if save_format not in ['tf', 'h5']:
+            raise ValueError("save_format must be either 'tf' or 'h5'")
+
+        try:
+            if save_format == 'h5':
+                # Save in HDF5 format
+                self.model.save(filepath + '.h5')
+                print(f"Model saved successfully in HDF5 format at {filepath}.h5")
+            else:
+                # Save in SavedModel format (TensorFlow's default)
+                self.model.save(filepath)
+                print(f"Model saved successfully in SavedModel format at {filepath}")
+
+            # If scaler exists, we might want to save it too using pickle
+            if self.scaler is not None:
+                import pickle
+                with open(f"{filepath}_scaler.pkl", 'wb') as f:
+                    pickle.dump(self.scaler, f)
+                print(f"Scaler saved at {filepath}_scaler.pkl")
+
+            # Save model configuration
+            import json
+            config = {
+                'output_steps': self.output_steps
+            }
+            with open(f"{filepath}_config.json", 'w') as f:
+                json.dump(config, f)
+            print(f"Model configuration saved at {filepath}_config.json")
+
+        except Exception as e:
+            print(f"Error saving model: {e}")
+            raise
+
+    @classmethod
+    def load_model(cls, filepath, custom_objects=None, save_format='tf'):
+        """
+        Load a previously saved model from disk.
+
+        Args:
+            filepath (str): Path to the saved model
+            custom_objects (dict): Optional dictionary mapping names to custom classes or functions
+            save_format (str): Format the model was saved in, either 'tf' for SavedModel format
+                              or 'h5' for HDF5 format
+
+        Returns:
+            LSTMModel: A new instance of LSTMModel with the loaded model and scaler
+
+        Example:
+            model = LSTMModel.load_model('path/to/model', save_format='h5')
+        """
+        from tensorflow.keras.models import load_model
+        import pickle
+        import json
+        import os
+
+        try:
+            # Load the Keras model
+            if save_format == 'h5':
+                model_path = filepath + '.h5'
+                keras_model = load_model(model_path, custom_objects=custom_objects)
+            else:
+                keras_model = load_model(filepath, custom_objects=custom_objects)
+
+            # Load the scaler if it exists
+            scaler = None
+            scaler_path = f"{filepath}_scaler.pkl"
+            if os.path.exists(scaler_path):
+                with open(scaler_path, 'rb') as f:
+                    scaler = pickle.load(f)
+
+            # Load configuration
+            config = {}
+            config_path = f"{filepath}_config.json"
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+
+            # Get input shape from the model
+            input_shape = keras_model.layers[0].input_shape[0][1:]
+
+            # Get output steps from config or infer from model
+            output_steps = config.get('output_steps', keras_model.layers[-1].output_shape[1])
+
+            # Create a new instance of LSTMModel
+            instance = cls(input_shape=input_shape, output_steps=output_steps, scaler=scaler)
+
+            # Replace the model with the loaded one
+            instance.model = keras_model
+
+            print(f"Model loaded successfully from {filepath}")
+            return instance
+
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
