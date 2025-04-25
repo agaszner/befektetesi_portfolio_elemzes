@@ -1,12 +1,13 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from .capm_analysis import CAPMAnalysis
 
 
 class DataProcessor():
 
     @classmethod
-    def make_sequences(cls, df, columns_to_select, window_size=288, forecast_horizon=12):
+    def make_sequences(cls, df, columns_to_select, window_size=288, forecast_horizon=12, return_absolute_prices=False):
         """
         Creates input-output sequences for LSTM training.
 
@@ -14,19 +15,34 @@ class DataProcessor():
         :param columns_to_select: list of column names to use as features (for X)
         :param window_size: number of time steps to use for input
         :param forecast_horizon: number of future steps to predict
+        :param return_absolute_prices: if True, returns absolute prices instead of price changes
         :return: tuple (X, y) where:
                  - X is a numpy array of shape (num_samples, window_size, num_features)
                  - y is a numpy array of shape (num_samples, forecast_horizon, 1)
+                   representing either price changes or absolute prices for each 5-min interval
         """
         data_X = df[columns_to_select].values
-        data_y = df['close'].values  # Only 'close' column for target
+        data_y = df['target'].values  # 'close' column for calculating changes
         X, y = [], []
 
         for i in range(len(df) - window_size - forecast_horizon + 1):
             X.append(data_X[i:i + window_size])
-            y.append(data_y[i + window_size:i + window_size + forecast_horizon])
 
-        return np.array(X), np.array(y).reshape(-1, forecast_horizon, 1)
+            # Get the close prices for the forecast horizon plus the last point of the window
+            close_prices = data_y[i + window_size - 1:i + window_size + forecast_horizon]
+
+            if return_absolute_prices:
+                # Use absolute prices for the forecast horizon (excluding the last point of the window)
+                y_values = close_prices[1:]
+            else:
+                y_values = close_prices[0]
+
+            y.append(y_values)
+
+        X_array = np.array(X)
+        y_array = np.array(y).reshape(-1, forecast_horizon)
+
+        return X_array, y_array
 
     @classmethod
     def add_features(cls, df):
@@ -39,14 +55,12 @@ class DataProcessor():
         """
         # 1) Price lag & returns
         scaler = StandardScaler()
-        for lag in [1,2,3,4,5,6,7,8,9,10,12]:
-            df[f'close_lag_{lag}'] = df['close'].shift(lag)
         df['return_1'] = df['close'].pct_change(1)
         df['return_5'] = df['close'].pct_change(5)
 
         # 2) Rolling stats on price
-        df['rolling_mean_3'] = df['close'].rolling(3).mean()
-        df['rolling_std_3']  = df['close'].rolling(3).std()
+        df['rolling_mean_12'] = df['close'].rolling(12).mean()
+        df['rolling_std_12']  = df['close'].rolling(12).std()
 
         # 3) Price range & typical price
         df['price_range']    = df['high'] - df['low']
@@ -81,28 +95,44 @@ class DataProcessor():
         df['macd_signal'] = macd_signal
 
         # 10) ATR (14)
-        df['atr'] = cls.compute_atr(df['high'], df['low'], df['close'], window=14)
+        df['atr'] = cls.compute_atr(df['high'], df['low'], df['close'], window=24)
 
         # 11) OBV (price‑based)
         df['obv'] = cls.compute_obv(df['close'], df['volume'])
+        start = df.index.min().strftime('%Y-%m-%dT%H:%M:%SZ')
+        end = df.index.max().strftime('%Y-%m-%dT%H:%M:%SZ')
+        capm = CAPMAnalysis.calculate_bitcoin_capm_with_market_average(start=start, stop=end)
+        df = df.merge(capm, on='time', how='left')
+        df.dropna(inplace=True)
+        df['target'] = (df['close'].shift(12) - df['close']) / df['close']
+        df['last_direction'] = np.where(df['target'].shift(1) > 0, 1, 0)
+        df['last_movement'] = df['target'].shift(1)
 
         #columns to scale
-        columns = ['close_lag_1', 'close_lag_2', 'close_lag_3', 'close_lag_4', 'close_lag_5',
-                     'close_lag_6', 'close_lag_7', 'close_lag_8', 'close_lag_9', 'close_lag_10',
-                     'rolling_mean_3', 'rolling_std_3', 'price_range', 'typical_price',
+        columns = ['rolling_mean_12', 'rolling_std_12', 'price_range', 'typical_price',
                      'vwap_20', 'vol_mean_10', 'vol_std_10', 'ma_7', 'ma_30',
                      'rsi_14', 'bb_mean_20', 'bb_std_20', 'bb_hband', 'bb_lband',
-                     'macd', 'macd_signal', 'atr', 'obv', 'close']
+                     'macd', 'macd_signal', 'atr', 'obv', 'alpha', 'beta', 'market_return', 'expected_return', 'actual_return', 'last_movement',
+                   'last_direction']
 
         df[columns] = scaler.fit_transform(df[columns])
-        return df, scaler, columns
+        y_scaler = StandardScaler()
+        df['target'] = y_scaler.fit_transform(df[['target']])
+        return df, scaler, columns, y_scaler
 
     @classmethod
     def compute_rsi(cls, series: pd.Series, window: int = 14) -> pd.Series:
         """
-        Relative Strength Index (RSI)
+        Compute the Relative Strength Index (RSI) for a given series.
+        The RSI is a momentum oscillator that measures the speed and change of price movements.
+
+        Args:
+            series (pd.Series): The input time series data
+            window (int): The window size for the RSI calculation
         """
         delta = series.diff()
+        delta = delta[1:]
+
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
 
@@ -114,7 +144,8 @@ class DataProcessor():
         rsi = 100 - (100 / (1 + rs))
         return rsi
 
-    def compute_ema(series: pd.Series, span: int) -> pd.Series:
+    @classmethod
+    def compute_ema(cls, series: pd.Series, span: int) -> pd.Series:
         """
         Exponential moving average (EMA)
         """

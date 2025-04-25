@@ -1,10 +1,12 @@
 import numpy as np
 import tensorflow as tf
+import os
+import datetime
+import pickle
 from tensorflow.keras import Input
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Bidirectional
-# Importáld az EarlyStopping callback-et
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Bidirectional, Reshape
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, TensorBoard
 
 class LSTMModel:
     """
@@ -21,49 +23,29 @@ class LSTMModel:
     The model is designed to predict future values in time series data based on historical patterns.
     """
 
-    def __init__(self, input_shape, output_steps, scaler=None, lstm_units=64, 
-                 num_layers=2, dropout_rate=0.2, use_bidirectional=True, 
-                 use_batch_norm=True, activation='relu'):
+    def __init__(self, input_shape, output_steps, activation='relu'):
         """
         Initializes the LSTM model.
 
         Args:
             input_shape (tuple): Shape of the input (timesteps, features)
             output_steps (int): Number of future timesteps to predict
-            scaler (optional): Scaler used for inverse transforming predictions
-            lstm_units (int): Number of LSTM units
-            num_layers (int): Number of LSTM layers
-            dropout_rate (float): Dropout rate for regularization
-            use_bidirectional (bool): Whether to use bidirectional LSTM
-            use_batch_norm (bool): Whether to use batch normalization
             activation (str): Activation function for dense layers
         """
-        self.scaler = scaler
         self.output_steps = output_steps
         self.model = self._build_model(
             input_shape, 
-            output_steps, 
-            lstm_units, 
-            num_layers, 
-            dropout_rate, 
-            use_bidirectional, 
-            use_batch_norm, 
+            output_steps,
             activation
         )
 
-    def _build_model(self, input_shape, output_steps, lstm_units, num_layers, 
-                     dropout_rate, use_bidirectional, use_batch_norm, activation):
+    def _build_model(self, input_shape, output_steps, activation):
         """
         Build a more complex LSTM model with multiple layers and regularization.
 
         Args:
             input_shape (tuple): Shape of the input (timesteps, features)
             output_steps (int): Number of future timesteps to predict
-            lstm_units (int): Number of LSTM units
-            num_layers (int): Number of LSTM layers
-            dropout_rate (float): Dropout rate for regularization
-            use_bidirectional (bool): Whether to use bidirectional LSTM
-            use_batch_norm (bool): Whether to use batch normalization
             activation (str): Activation function for dense layers
 
         Returns:
@@ -72,69 +54,71 @@ class LSTMModel:
         model = Sequential()
         model.add(Input(shape=input_shape))
 
-        # Add LSTM layers
-        for i in range(num_layers):
-            return_sequences = i < num_layers - 1  # Return sequences for all but the last layer
+        model.add(LSTM(128, return_sequences=True))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.2))
 
-            # Create LSTM layer
-            if use_bidirectional:
-                lstm_layer = Bidirectional(
-                    LSTM(lstm_units, return_sequences=return_sequences)
-                )
-            else:
-                lstm_layer = LSTM(lstm_units, return_sequences=return_sequences)
+        model.add(LSTM(64, return_sequences=False))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.2))
 
-            model.add(lstm_layer)
-
-            # Add batch normalization if enabled
-            if use_batch_norm:
-                model.add(BatchNormalization())
-
-            # Add dropout for regularization
-            if dropout_rate > 0:
-                model.add(Dropout(dropout_rate))
-
-        # Output layers
-        model.add(Dense(128, activation=activation))
-        if dropout_rate > 0:
-            model.add(Dropout(dropout_rate/2))
+        model.add(Dense(32, activation=activation))
+        model.add(Dropout(0.1))
         model.add(Dense(output_steps))
-        model.add(tf.keras.layers.Reshape((output_steps, 1)))  # output: (batch, output_steps, 1)
+        model.add(Reshape((output_steps, 1)))  # output: (batch, output_steps, 1)
 
-        model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        model.compile(optimizer='adam', loss=weighted_directional_mae(alpha=5.0), metrics=['mse', directional_accuracy])
+        model.summary()
         return model
 
-    def fit(self, X_train, y_train, epochs=10, batch_size=32, patience=10):
+    def fit(self, X_train, y_train, X_val, y_val, epochs=200, batch_size=128, patience=10):
         """
         Train the LSTM model with early stopping.
 
         Args:
             X_train (ndarray): Input sequence data
             y_train (ndarray): Target sequence data
+            X_val (ndarray): Validation input sequence data
+            y_val (ndarray): Validation target sequence data
             epochs (int): Maximum number of training epochs
             batch_size (int): Batch size
-            validation_split (float): Fraction of training data for validation. 
-                                      Consider using manual chronological split for time series.
             patience (int): Number of epochs with no improvement after which training will be stopped.
         """
-        # Definiáljuk az Early Stopping callback-et
-        # Figyeli a validációs veszteséget (val_loss)
-        # patience: Hány epoch-ig vár javulás nélkül, mielőtt leállna
-        # restore_best_weights: Visszaállítja a legjobb súlyokat a tanítás végén
-        early_stopping = EarlyStopping(monitor='loss', patience=patience, restore_best_weights=True)
+        early_stopping = EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)
 
-        # Adjuk át a callback-et a fit metódusnak a callbacks listában
+        reduce_lr = ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+            verbose=1
+        )
+
+        checkpoint_cb = ModelCheckpoint(
+            filepath='models/best_model.h5',
+            monitor='val_loss',
+            save_best_only=True,
+            mode='min',
+            save_weights_only=False,
+            verbose=1
+        )
+
+        log_dir = os.path.join("logs", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        tensorboard_cb = TensorBoard(log_dir=log_dir, histogram_freq=1)
+
         print(f"Training started with EarlyStopping (patience={patience})...")
+
         history = self.model.fit(
             X_train, 
-            y_train, 
+            y_train,
+            validation_data=(X_val, y_val),
             epochs=epochs, 
             batch_size=batch_size,
-            callbacks=[early_stopping], # Itt adjuk hozzá a callback-et
+            callbacks=[early_stopping, reduce_lr, checkpoint_cb, tensorboard_cb],
             verbose=1
         )
         print("Training finished.")
-        return history # Opcionálisan visszaadhatjuk a history objektumot
+        return history
 
     def predict(self, data):
         """
@@ -144,66 +128,40 @@ class LSTMModel:
             data (array-like): Input data of shape (samples, timesteps, features)
 
         Returns:
-            array-like: Predicted values of shape (samples, output_steps, features)
+            ndarray: Predicted values of shape (samples, output_steps)
         """
-        preds = self.model.predict(data)
+        # Get predictions from the model
+        predictions = self.model.predict(data)
 
-        if self.scaler:
-            # Reshape for inverse transform if scaler was fit on 2D
-            batch, steps, features = preds.shape
-            # Ellenőrizzük, hogy a scaler létezik-e és van-e inverse_transform metódusa
-            if hasattr(self.scaler, 'inverse_transform'):
-                try:
-                    # Feltételezzük, hogy a scaler 1 feature-re lett illesztve, ha a features=1
-                    # Ha több feature van, a reshape és inverse_transform logikát lehet, hogy igazítani kell
-                    num_features_scaled = self.scaler.n_features_in_ if hasattr(self.scaler, 'n_features_in_') else features
+        acc, cov = confidence_filtered_accuracy(y_true, y_pred_proba, threshold=0.85)
+        print(f"Confidence-Filtered Accuracy: {acc:.2f}, Coverage: {cov:.2%}")
 
-                    # Fontos: A reshape az inverse_transform előtt illeszkedjen ahhoz, ahogy a scaler-t illesztették
-                    # Gyakran (samples * steps, num_features_scaled) alakra van szükség
-                    reshaped_preds = preds.reshape(-1, features)
+        return predictions
 
-                    # Ha a scaler kevesebb feature-re lett illesztve, mint a modell kimenete (ami itt 1),
-                    # akkor valószínűleg csak ezt az 1 feature-t kell visszaalakítani.
-                    # Ha a scaler több feature-re lett illesztve, akkor dummy adatokat kellhet hozzáadni
-                    # a visszaalakításhoz, vagy a scaler-t csak a célváltozóra kellett volna illeszteni.
-                    # Az egyszerűség kedvéért feltételezzük, hogy a scaler 1 feature-re (a célváltozóra) lett illesztve.
-                    if features == 1 and num_features_scaled == 1:
-                         inverted_preds = self.scaler.inverse_transform(reshaped_preds)
-                         preds = inverted_preds.reshape(batch, steps, features)
-                    elif features == 1 and num_features_scaled > 1:
-                        # Ha a scaler több oszlopra lett illesztve, de csak egyet jósolunk,
-                        # létre kell hozni egy megfelelő alakú tömböt az inverse_transformhoz.
-                        # Ez feltételezi, hogy a jósolt 'close' az ELSŐ oszlop volt a scaler illesztésekor.
-                        # EZT A RÉSZT FELÜL KELL VIZSGÁLNI AZ ADATFELDOLGOZÁS ALAPJÁN!
-                        print(f"Warning: Inverse transform assumes the predicted feature was the first feature during scaling.")
-                        placeholder = np.zeros((reshaped_preds.shape[0], num_features_scaled))
-                        placeholder[:, 0] = reshaped_preds[:, 0] # Betöltjük a jóslatokat az első oszlopba
-                        inverted_placeholder = self.scaler.inverse_transform(placeholder)
-                        preds = inverted_placeholder[:, 0].reshape(batch, steps, 1) # Csak az első (jósolt) oszlopot vesszük vissza
-                    else:
-                         # Kezelni kell az esetet, ha több feature-t jósol a modell (features > 1)
-                         # vagy ha a scaler feature száma nem egyezik.
-                         print(f"Warning: Scaler feature count ({num_features_scaled}) and model output feature count ({features}) mismatch requires specific handling.")
-                         # Ebben az esetben nem végezzük el az inverz transzformációt, vagy hibát dobunk.
-                         # A biztonság kedvéért most nem alakítunk vissza:
-                         pass # vagy raise ValueError("Feature mismatch during inverse scaling")
+    def evaluate(self, X_test, y_test):
+        """
+        Evaluate the LSTM model on test data.
 
-                except Exception as e:
-                    print(f"Error during inverse scaling: {e}")
-                    # Hiba esetén a skálázott predikciókat adjuk vissza
-            else:
-                print("Warning: Scaler does not have an inverse_transform method.")
+        Args:
+            X_test (ndarray): Test input sequence data
+            y_test (ndarray): Test target sequence data
 
-        return preds
+        Returns:
+            float: Loss value
+        """
+        loss, mse, directional_accuracy_test = self.model.evaluate(X_test, y_test, verbose=1)
+        print(f"Test Loss: {loss}, MSE: {mse}, Directional Accuracy: {directional_accuracy}")
 
-    def save_model(self, filepath, save_format='tf'):
+        acc, cov = confidence_filtered_accuracy(y_true, y_pred_proba, threshold=0.5)
+        print(f"Confidence-Filtered Accuracy: {acc:.2f}, Coverage: {cov:.2%}")
+        return loss
+
+    def save_model(self, scaler=None):
         """
         Save the trained model to disk.
 
         Args:
             filepath (str): Path where the model will be saved
-            save_format (str): Format to save the model, either 'tf' for SavedModel format
-                              or 'h5' for HDF5 format
 
         Returns:
             None
@@ -211,98 +169,134 @@ class LSTMModel:
         Example:
             model.save_model('path/to/model', save_format='h5')
         """
-        if save_format not in ['tf', 'h5']:
-            raise ValueError("save_format must be either 'tf' or 'h5'")
 
         try:
-            if save_format == 'h5':
-                # Save in HDF5 format
-                self.model.save(filepath + '.h5')
-                print(f"Model saved successfully in HDF5 format at {filepath}.h5")
-            else:
-                # Save in SavedModel format (TensorFlow's default)
-                self.model.save(filepath)
-                print(f"Model saved successfully in SavedModel format at {filepath}")
+            model_path = os.path.join("models", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
-            # If scaler exists, we might want to save it too using pickle
-            if self.scaler is not None:
-                import pickle
-                with open(f"{filepath}_scaler.pkl", 'wb') as f:
-                    pickle.dump(self.scaler, f)
-                print(f"Scaler saved at {filepath}_scaler.pkl")
+            os.makedirs(model_path, exist_ok=True)
+            self.model.save(model_path + '.keras')
+            print(f"Model saved successfully to {model_path}.keras")
 
-            # Save model configuration
-            import json
-            config = {
-                'output_steps': self.output_steps
-            }
-            with open(f"{filepath}_config.json", 'w') as f:
-                json.dump(config, f)
-            print(f"Model configuration saved at {filepath}_config.json")
-
+            if scaler is not None:
+                scaler_path = os.path.join(model_path, 'scaler.pkl')
+                with open(scaler_path, 'wb') as f:
+                    pickle.dump(scaler, f)
+                print(f"Scaler saved successfully to {scaler_path}")
         except Exception as e:
             print(f"Error saving model: {e}")
             raise
 
     @classmethod
-    def load_model(cls, filepath, custom_objects=None, save_format='tf'):
+    def load_model(cls, filepath, save_format='.keras'):
         """
         Load a previously saved model from disk.
 
         Args:
             filepath (str): Path to the saved model
-            custom_objects (dict): Optional dictionary mapping names to custom classes or functions
-            save_format (str): Format the model was saved in, either 'tf' for SavedModel format
-                              or 'h5' for HDF5 format
+            save_format (str): Format the model was saved in, default is '.keras'
 
         Returns:
             LSTMModel: A new instance of LSTMModel with the loaded model and scaler
 
-        Example:
-            model = LSTMModel.load_model('path/to/model', save_format='h5')
         """
-        from tensorflow.keras.models import load_model
-        import pickle
-        import json
-        import os
 
         try:
-            # Load the Keras model
-            if save_format == 'h5':
-                model_path = filepath + '.h5'
-                keras_model = load_model(model_path, custom_objects=custom_objects)
-            else:
-                keras_model = load_model(filepath, custom_objects=custom_objects)
+            model = tf.keras.models.load_model(filepath, custom_objects={'directional_accuracy': directional_accuracy, 'weighted_directional_mae': weighted_directional_mae})
+            print(f"Model loaded successfully from {filepath}")
 
-            # Load the scaler if it exists
-            scaler = None
-            scaler_path = f"{filepath}_scaler.pkl"
+            scaler_path = os.path.join(filepath, 'scaler.pkl')
             if os.path.exists(scaler_path):
                 with open(scaler_path, 'rb') as f:
                     scaler = pickle.load(f)
+                print(f"Scaler loaded successfully from {scaler_path}")
+            else:
+                scaler = None
 
-            # Load configuration
-            config = {}
-            config_path = f"{filepath}_config.json"
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-
-            # Get input shape from the model
-            input_shape = keras_model.layers[0].input_shape[0][1:]
-
-            # Get output steps from config or infer from model
-            output_steps = config.get('output_steps', keras_model.layers[-1].output_shape[1])
-
-            # Create a new instance of LSTMModel
-            instance = cls(input_shape=input_shape, output_steps=output_steps, scaler=scaler)
-
-            # Replace the model with the loaded one
-            instance.model = keras_model
-
-            print(f"Model loaded successfully from {filepath}")
-            return instance
-
+            return cls(model.input_shape[1:], model.output_steps), scaler
         except Exception as e:
             print(f"Error loading model: {e}")
             raise
+
+
+def directional_accuracy(y_true, y_pred):
+    """
+    If the predicted direction matches the true direction, return 1, otherwise 0.
+
+    Args:
+        y_true (tensor): True values
+        y_pred (tensor): Predicted values
+    Returns:
+        float: Directional accuracy
+    """
+    y_true_direction = tf.sign(y_true)
+    y_pred_direction = tf.sign(y_pred)
+
+    matches = tf.cast(tf.equal(y_true_direction, y_pred_direction), tf.float32)
+
+    return tf.reduce_mean(matches)
+
+
+def weighted_directional_mae(alpha=1.0):
+    """
+    Weighted Directional Mean Absolute Error (MAE) loss function.
+    This loss function penalizes the model more when the predicted direction is wrong.
+
+    Args:
+        alpha (float): Weighting factor for the directional penalty. Default is 1.0.
+
+    Returns:
+        loss (function): A function that computes the weighted directional MAE.
+    """
+    mae = tf.keras.losses.MeanAbsoluteError()
+
+    def loss(y_true, y_pred):
+        # 1) sima MAE
+        base = mae(y_true, y_pred)  # dim=(batch,)
+
+        # 2) igaz és becsült irány
+        #   y_true, y_pred shape=(batch, 1)
+        diff_true = y_true - tf.roll(y_true, shift=1, axis=0)  # egyszerűsítés: előző batchhez képest
+        diff_pred = y_pred - tf.roll(y_pred, shift=1, axis=0)
+        sign_true = tf.sign(diff_true)
+        sign_pred = tf.sign(diff_pred)
+
+        # 3) irányegyezés vizsgálata
+        wrong_dir = tf.cast(tf.not_equal(sign_true, sign_pred), tf.float32)
+
+        # 4) súlyozás: ha wrong_dir=1 → weight=1+alpha, különben weight=1
+        weight = 1.0 + alpha * wrong_dir
+
+        return tf.reduce_mean(base * weight)
+
+    return loss
+
+
+def confidence_filtered_directional_accuracy(y_true, y_pred, threshold=0.5):
+    """
+    Calculate the directional accuracy of predictions with a confidence threshold.
+
+    Args:
+        y_true (array-like): True values
+        y_pred (array-like): Predicted values
+        threshold (float): Confidence threshold for predictions
+
+    Returns:
+        tuple: Directional accuracy and coverage.
+    """
+    y_pred = np.array(y_pred)
+    y_true = np.array(y_true)
+
+    confident_mask = np.abs(y_pred) >= threshold
+    confident_preds = np.sign(y_pred[confident_mask])
+    confident_truth = np.sign(y_true[confident_mask])
+
+    if len(confident_preds) == 0:
+        return None, 0.0
+
+    directional_accuracy_confidence = (confident_preds == confident_truth).mean()
+    coverage = confident_mask.mean()
+
+    return directional_accuracy_confidence, coverage
+
+
+

@@ -55,7 +55,6 @@ class InfluxDBQueries():
                 from(bucket: "{bucket}")
                   |> range(start: {start_dt.isoformat()}, stop: {chunk_stop_dt.isoformat()})
                   |> filter(fn: (r) => r["_measurement"] == "crypto" and r["_field"] == "volume" and r["pair"] == "{pair}")
-                  |> difference(nonNegative: true)
                   |> aggregateWindow(every: {groupby_time}, fn: sum, createEmpty: false)
                   |> yield(name: "volume")
                 """

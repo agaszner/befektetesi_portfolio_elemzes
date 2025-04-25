@@ -1,6 +1,3 @@
-"""
-Centralized InfluxDB client creation module.
-"""
 from influxdb_client import InfluxDBClient, WriteOptions
 from . import config
 
