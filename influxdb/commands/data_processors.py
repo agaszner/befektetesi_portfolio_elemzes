@@ -2,12 +2,14 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from .capm_analysis import CAPMAnalysis
+from boruta import BorutaPy
+from sklearn.ensemble import RandomForestRegressor
 
 
 class DataProcessor():
 
     @classmethod
-    def make_sequences(cls, df, columns_to_select, window_size=288, forecast_horizon=12, return_absolute_prices=False):
+    def make_sequences(cls, df, columns_to_select, window_size=288, forecast_horizon=12):
         """
         Creates input-output sequences for LSTM training.
 
@@ -15,32 +17,40 @@ class DataProcessor():
         :param columns_to_select: list of column names to use as features (for X)
         :param window_size: number of time steps to use for input
         :param forecast_horizon: number of future steps to predict
-        :param return_absolute_prices: if True, returns absolute prices instead of price changes
         :return: tuple (X, y) where:
                  - X is a numpy array of shape (num_samples, window_size, num_features)
                  - y is a numpy array of shape (num_samples, forecast_horizon, 1)
                    representing either price changes or absolute prices for each 5-min interval
         """
         data_X = df[columns_to_select].values
-        data_y = df['target'].values  # 'close' column for calculating changes
+        data_y = df['target'].values
+        data_close = df['close'].values
         X, y = [], []
 
         for i in range(len(df) - window_size - forecast_horizon + 1):
             X.append(data_X[i:i + window_size])
 
-            # Get the close prices for the forecast horizon plus the last point of the window
-            close_prices = data_y[i + window_size - 1:i + window_size + forecast_horizon]
+            if forecast_horizon == 1:
+                close_prices = data_y[i + window_size - 1:i + window_size + forecast_horizon]
+            else:
+                close_prices = data_close[i + window_size - 1:i + window_size + forecast_horizon]
 
-            if return_absolute_prices:
-                # Use absolute prices for the forecast horizon (excluding the last point of the window)
-                y_values = close_prices[1:]
+            if forecast_horizon > 1:
+                base_price = close_prices[0]
+                y_values = ((close_prices[1:] - base_price) / base_price)
             else:
                 y_values = close_prices[0]
 
             y.append(y_values)
 
         X_array = np.array(X)
-        y_array = np.array(y).reshape(-1, forecast_horizon)
+
+        y_array = np.array(y)
+
+        if forecast_horizon > 1:
+            y_array = y_array.reshape(-1, forecast_horizon, 1)
+        else:
+            y_array = y_array.reshape(-1, 1, 1)
 
         return X_array, y_array
 
@@ -53,137 +63,155 @@ class DataProcessor():
           df with new feature columns for modeling 1h‑ahead moves.
         Requires helper funcs: compute_rsi, compute_macd, compute_atr, compute_obv (as before).
         """
-        # 1) Price lag & returns
-        scaler = StandardScaler()
         df['return_1'] = df['close'].pct_change(1)
         df['return_5'] = df['close'].pct_change(5)
 
-        # 2) Rolling stats on price
-        df['rolling_mean_12'] = df['close'].rolling(12).mean()
-        df['rolling_std_12']  = df['close'].rolling(12).std()
+        # Rolling statistics (mean, std) and range for windows 5,12,24
+        for w in [5, 12, 24]:
+            df[f'close_ma_{w}'] = df['close'].rolling(window=w).mean()
+            df[f'close_std_{w}'] = df['close'].rolling(window=w).std()
+            df[f'return_mean_{w}'] = df['return_1'].rolling(window=w).mean()
+            df[f'return_std_{w}'] = df['return_1'].rolling(window=w).std()
+            df[f'range_{w}'] = df['high'].rolling(w).max() - df['low'].rolling(w).min()
+            df[f'vol_mean_{w}'] = df['volume'].rolling(window=w).mean()
+            df[f'vol_std_{w}'] = df['volume'].rolling(window=w).std()
 
-        # 3) Price range & typical price
-        df['price_range']    = df['high'] - df['low']
-        df['typical_price']  = (df['high'] + df['low'] + df['close']) / 3
+        # Trend features: simple moving averages (fast and slow) and their difference
+        df['sma_fast'] = df['close'].rolling(window=5).mean()
+        df['sma_slow'] = df['close'].rolling(window=24).mean()
+        df['ma_diff'] = df['sma_fast'] - df['sma_slow']
 
-        # 4) VWAP (20‑period rolling)
-        df['vwap_20'] = (
-            (df['typical_price'] * df['volume']).rolling(20).sum()
-            / df['volume'].rolling(20).sum()
-        )
-
-        # 5) Volume stats
-        df['vol_mean_10'] = df['volume'].rolling(10).mean()
-        df['vol_std_10']  = df['volume'].rolling(10).std()
-
-        # 6) Moving averages
-        df['ma_7']  = df['close'].rolling(7).mean()
-        df['ma_30'] = df['close'].rolling(30).mean()
-
-        # 7) RSI (14)
+        # Momentum indicators
         df['rsi_14'] = cls.compute_rsi(df['close'], window=14)
+        df['macd'], df['macd_signal'], df['macd_hist'] = cls.compute_macd(df['close'], fast=12, slow=26, signal=9)
+        # Stochastic Oscillator (fast %K and slow %D)
+        low_min = df['low'].rolling(window=14).min()
+        high_max = df['high'].rolling(window=14).max()
+        df['stoch_k'] = 100 * (df['close'] - low_min) / (high_max - low_min)
+        df['stoch_d'] = df['stoch_k'].rolling(window=3).mean()
 
-        # 8) Bollinger Bands (20,2)
-        df['bb_mean_20'] = df['close'].rolling(20).mean()
-        df['bb_std_20']  = df['close'].rolling(20).std()
-        df['bb_hband']   = df['bb_mean_20'] + 2 * df['bb_std_20']
-        df['bb_lband']   = df['bb_mean_20'] - 2 * df['bb_std_20']
+        # Volatility indicators
+        # True Range and ATR (14-period)&#8203;:contentReference[oaicite:3]{index=3}
+        df['tr'] = np.maximum.reduce([
+            df['high'] - df['low'],
+            (df['high'] - df['close'].shift(1)).abs(),
+            (df['low'] - df['close'].shift(1)).abs()
+        ])
+        df['atr_14'] = df['tr'].rolling(window=14).mean()
+        # Bollinger Bands (20-period, 2*std)
+        df['bb_mid'] = df['close'].rolling(window=20).mean()
+        df['bb_std'] = df['close'].rolling(window=20).std()
+        df['bb_upper'] = df['bb_mid'] + 2 * df['bb_std']
+        df['bb_lower'] = df['bb_mid'] - 2 * df['bb_std']
+        df['bb_width'] = df['bb_upper'] - df['bb_lower']
 
-        # 9) MACD & signal
-        macd_line, macd_signal = cls.compute_macd(df['close'])
-        df['macd']        = macd_line
-        df['macd_signal'] = macd_signal
+        # Volume features
+        # VWAP (24-period rolling)
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        df['vwap'] = (typical_price * df['volume']).rolling(window=24).sum() / df['volume'].rolling(window=24).sum()
 
-        # 10) ATR (14)
-        df['atr'] = cls.compute_atr(df['high'], df['low'], df['close'], window=24)
-
-        # 11) OBV (price‑based)
+        # Liquidity / market structure
         df['obv'] = cls.compute_obv(df['close'], df['volume'])
-        start = df.index.min().strftime('%Y-%m-%dT%H:%M:%SZ')
-        end = df.index.max().strftime('%Y-%m-%dT%H:%M:%SZ')
-        capm = CAPMAnalysis.calculate_bitcoin_capm_with_market_average(start=start, stop=end)
+        df['range_cur'] = df['high'] - df['low']
+        df['range_pct'] = df['range_cur'] / df['close']
+
+        capm = CAPMAnalysis.calculate_bitcoin_capm_with_market_average(
+            start=df.index.min().strftime('%Y-%m-%dT%H:%M:%SZ'), stop=df.index.max().strftime('%Y-%m-%dT%H:%M:%SZ'))
+
         df = df.merge(capm, on='time', how='left')
         df.dropna(inplace=True)
-        df['target'] = (df['close'].shift(12) - df['close']) / df['close']
-        df['last_direction'] = np.where(df['target'].shift(1) > 0, 1, 0)
-        df['last_movement'] = df['target'].shift(1)
 
-        #columns to scale
-        columns = ['rolling_mean_12', 'rolling_std_12', 'price_range', 'typical_price',
-                     'vwap_20', 'vol_mean_10', 'vol_std_10', 'ma_7', 'ma_30',
-                     'rsi_14', 'bb_mean_20', 'bb_std_20', 'bb_hband', 'bb_lband',
-                     'macd', 'macd_signal', 'atr', 'obv', 'alpha', 'beta', 'market_return', 'expected_return', 'actual_return', 'last_movement',
-                   'last_direction']
+        df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
 
-        df[columns] = scaler.fit_transform(df[columns])
-        y_scaler = StandardScaler()
-        df['target'] = y_scaler.fit_transform(df[['target']])
-        return df, scaler, columns, y_scaler
+        feature_cols = [col for col in df.columns if col not in ['open','high','low','close','volume','tr','bb_mid','bb_std', 'target', 'alpha', 'risk_free_rate']]
+        scaler = StandardScaler()
+        df[feature_cols] = scaler.fit_transform(df[feature_cols])
+        target_scaler = StandardScaler()
+        df['target'] = target_scaler.fit_transform(df[['target']])
+
+        return df, scaler, feature_cols, target_scaler
 
     @classmethod
-    def compute_rsi(cls, series: pd.Series, window: int = 14) -> pd.Series:
+    def compute_rsi(cls, series, window=14):
         """
-        Compute the Relative Strength Index (RSI) for a given series.
-        The RSI is a momentum oscillator that measures the speed and change of price movements.
-
-        Args:
-            series (pd.Series): The input time series data
-            window (int): The window size for the RSI calculation
+        Compute Relative Strength Index (RSI) using Wilder's smoothing.
+        RSI = 100 - (100/(1 + RS)), where RS = avg_gain/avg_loss&#8203;:contentReference[oaicite:0]{index=0}.
         """
         delta = series.diff()
-        delta = delta[1:]
-
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-
-        # Use simple moving average of gains/losses
-        avg_gain = gain.rolling(window).mean()
-        avg_loss = loss.rolling(window).mean()
-
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
         return rsi
 
     @classmethod
-    def compute_ema(cls, series: pd.Series, span: int) -> pd.Series:
+    def compute_macd(cls, series, fast=12, slow=26, signal=9):
         """
-        Exponential moving average (EMA)
+        Compute MACD line, signal line, and histogram.
+        MACD = EMA_fast - EMA_slow; Signal = EMA(MACD, signal); Histogram = MACD - Signal&#8203;:contentReference[oaicite:1]{index=1}.
         """
-        return series.ewm(span=span, adjust=False).mean()
+        ema_fast = series.ewm(span=fast, adjust=False).mean()
+        ema_slow = series.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        macd_hist = macd_line - signal_line
+        return macd_line, signal_line, macd_hist
 
     @classmethod
-    def compute_macd(cls, series: pd.Series) -> (pd.Series, pd.Series):
+    def compute_obv(cls, close, volume):
         """
-        MACD line and signal line
-        - MACD line = EMA12 − EMA26
-        - Signal line = 9‑period EMA of MACD line
+        Compute On-Balance Volume (OBV) cumulative.
+        OBV increases by volume on up days and decreases on down days&#8203;:contentReference[oaicite:2]{index=2}.
         """
-        ema12 = cls.compute_ema(series, span=12)
-        ema26 = cls.compute_ema(series, span=26)
-        macd_line = ema12 - ema26
-        signal_line = macd_line.ewm(span=9, adjust=False).mean()
-        return macd_line, signal_line
-
-    @classmethod
-    def compute_atr(cls, high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-        """
-        Average True Range (ATR)
-        """
-        tr1 = high - low
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
-
-        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = true_range.rolling(window).mean()
-        return atr
-
-    @classmethod
-    def compute_obv(cls, close: pd.Series, volume: pd.Series) -> pd.Series:
-        """
-        On-Balance Volume (OBV)
-        """
-        # +volume on up days, -volume on down days
-        direction = np.sign(close.diff()).fillna(0)
-        obv = (direction * volume).cumsum()
+        signs = np.sign(close.diff().fillna(0))
+        obv = (signs * volume).cumsum()
         return obv
+
+    @classmethod
+    def select_features_boruta(cls, df, feature_cols, target_col='target',
+                               estimator=None, n_estimators='auto', max_iter=100, random_state=42):
+        """
+        Perform Boruta feature selection on provided features and target.
+
+        Inputs:
+          df           - DataFrame containing features and target
+          feature_cols - list of feature column names
+          target_col   - name of the target column
+          estimator    - sklearn estimator, default RandomForestRegressor
+          n_estimators - 'auto' or int, number of trees for the RF in Boruta
+          max_iter     - maximum iterations for Boruta
+          random_state - seed for reproducibility
+
+        Returns:
+          selected_features - list of features confirmed by Boruta
+          boruta_selector   - fitted BorutaPy object
+        """
+        X = df[feature_cols].values
+        y = df[target_col].values.ravel()
+
+        # Default estimator
+        if estimator is None:
+            rf = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
+        else:
+            rf = estimator
+
+        # Initialize Boruta
+        boruta_selector = BorutaPy(
+            estimator=rf,
+            n_estimators=n_estimators,
+            max_iter=max_iter,
+            random_state=random_state,
+            verbose=2
+        )
+
+        # Run Boruta
+        boruta_selector.fit(X, y)
+
+        # Extract selected features
+        selected_mask = boruta_selector.support_
+        selected_features = [f for f, keep in zip(feature_cols, selected_mask) if keep]
+
+        return selected_features, boruta_selector
 

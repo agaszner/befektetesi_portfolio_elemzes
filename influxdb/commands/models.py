@@ -5,7 +5,7 @@ import datetime
 import pickle
 from tensorflow.keras import Input
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Bidirectional, Reshape
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Bidirectional, Reshape, Conv1D, MaxPooling1D
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, TensorBoard
 
 class LSTMModel:
@@ -23,7 +23,7 @@ class LSTMModel:
     The model is designed to predict future values in time series data based on historical patterns.
     """
 
-    def __init__(self, input_shape, output_steps, activation='relu'):
+    def __init__(self, input_shape, output_steps, activation='linear'):
         """
         Initializes the LSTM model.
 
@@ -54,17 +54,22 @@ class LSTMModel:
         model = Sequential()
         model.add(Input(shape=input_shape))
 
-        model.add(LSTM(128, return_sequences=True))
+        model.add(Conv1D(filters=32, kernel_size=3, activation='relu', padding='same'))
+        model.add(MaxPooling1D(pool_size=2))
         model.add(BatchNormalization())
         model.add(Dropout(0.2))
 
-        model.add(LSTM(64, return_sequences=False))
+        model.add(LSTM(128, return_sequences=True, recurrent_dropout=0.2))
         model.add(BatchNormalization())
         model.add(Dropout(0.2))
 
-        model.add(Dense(32, activation=activation))
+        model.add(LSTM(64, return_sequences=False, recurrent_dropout=0.2))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.2))
+
+        model.add(Dense(32, activation='tanh'))
         model.add(Dropout(0.1))
-        model.add(Dense(output_steps))
+        model.add(Dense(output_steps, activation='linear'))
         model.add(Reshape((output_steps, 1)))  # output: (batch, output_steps, 1)
 
         model.compile(optimizer='adam', loss=weighted_directional_mae(alpha=5.0), metrics=['mse', directional_accuracy])
@@ -95,7 +100,7 @@ class LSTMModel:
         )
 
         checkpoint_cb = ModelCheckpoint(
-            filepath='models/best_model.h5',
+            filepath='models/best_model.keras',
             monitor='val_loss',
             save_best_only=True,
             mode='min',
@@ -133,9 +138,6 @@ class LSTMModel:
         # Get predictions from the model
         predictions = self.model.predict(data)
 
-        acc, cov = confidence_filtered_accuracy(y_true, y_pred_proba, threshold=0.85)
-        print(f"Confidence-Filtered Accuracy: {acc:.2f}, Coverage: {cov:.2%}")
-
         return predictions
 
     def evaluate(self, X_test, y_test):
@@ -152,8 +154,9 @@ class LSTMModel:
         loss, mse, directional_accuracy_test = self.model.evaluate(X_test, y_test, verbose=1)
         print(f"Test Loss: {loss}, MSE: {mse}, Directional Accuracy: {directional_accuracy}")
 
-        acc, cov = confidence_filtered_accuracy(y_true, y_pred_proba, threshold=0.5)
+        acc, cov = confidence_filtered_directional_accuracy(y_test, self.model.predict(X_test), threshold=0.3)
         print(f"Confidence-Filtered Accuracy: {acc:.2f}, Coverage: {cov:.2%}")
+
         return loss
 
     def save_model(self, scaler=None):

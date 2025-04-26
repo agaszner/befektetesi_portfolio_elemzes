@@ -107,9 +107,7 @@ class CAPMAnalysis:
 
         btc_data['return'] = btc_data['close'].pct_change()
 
-        # Remove NaN values
         btc_data = btc_data.dropna()
-        print(len(btc_data))
 
         merged_data = pd.merge(
             market_df[['market_return']], 
