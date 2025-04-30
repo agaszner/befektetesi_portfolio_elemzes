@@ -66,13 +66,17 @@ class UploadToInflux:
             for _, row in df.iterrows():
                 timestamp_ns = int(row['open_time'] / 1000)
                 precision = WritePrecision.MS if year == 2025 else WritePrecision.S
-                point = (Point("crypto").tag("pair", symbol)
+                point = (((((Point("crypto").tag("pair", symbol)
                         .time(timestamp_ns, precision)
                         .field("open", float(row['open']))
                         .field("high", float(row['high']))
                         .field("low", float(row['low']))
                         .field("close", float(row['close']))
                         .field("volume", float(row['volume'])))
+                         .field("quote_volume", float(row['quote_volume'])))
+                         .field("trades", int(row['trades'])))
+                         .field("tb_base", float(row['tb_base'])))
+                         .field("tb_quote", float(row['tb_quote'])))
                 points.append(point)
 
             write_api.write(bucket=bucket, org=org, record=points)

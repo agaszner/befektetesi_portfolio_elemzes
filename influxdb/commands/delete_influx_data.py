@@ -3,6 +3,8 @@ from .. import config
 from .. import client
 
 class DeleteInfluxData:
+    influxdb_client = None
+
     def __init__(self):
         self.influxdb_client = client.get_client()
 

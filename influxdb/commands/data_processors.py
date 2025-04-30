@@ -1,15 +1,16 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import pickle
 from .capm_analysis import CAPMAnalysis
 from boruta import BorutaPy
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 
 
 class DataProcessor():
 
     @classmethod
-    def make_sequences(cls, df, columns_to_select, window_size=288, forecast_horizon=12):
+    def make_sequences(cls, df, columns_to_select, window_size=288, forecast_horizon=12, classification=False):
         """
         Creates input-output sequences for LSTM training.
 
@@ -17,6 +18,7 @@ class DataProcessor():
         :param columns_to_select: list of column names to use as features (for X)
         :param window_size: number of time steps to use for input
         :param forecast_horizon: number of future steps to predict
+        :param classification: if True, y will be a binary classification target
         :return: tuple (X, y) where:
                  - X is a numpy array of shape (num_samples, window_size, num_features)
                  - y is a numpy array of shape (num_samples, forecast_horizon, 1)
@@ -47,15 +49,18 @@ class DataProcessor():
 
         y_array = np.array(y)
 
-        if forecast_horizon > 1:
-            y_array = y_array.reshape(-1, forecast_horizon, 1)
+        if classification:
+            y_array = y_array.reshape(-1, 1)
         else:
-            y_array = y_array.reshape(-1, 1, 1)
+            if forecast_horizon > 1:
+                y_array = y_array.reshape(-1, forecast_horizon, 1)
+            else:
+                y_array = y_array.reshape(-1, 1, 1)
 
         return X_array, y_array
 
     @classmethod
-    def add_features(cls, df):
+    def add_features(cls, df, classification=False, group_time='5m'):
         """
         Input:
           df indexed by 5‑min timestamps, columns: ['open','high','low','close','volume']
@@ -67,7 +72,7 @@ class DataProcessor():
         df['return_5'] = df['close'].pct_change(5)
 
         # Rolling statistics (mean, std) and range for windows 5,12,24
-        for w in [5, 12, 24]:
+        for w in [24]:
             df[f'close_ma_{w}'] = df['close'].rolling(window=w).mean()
             df[f'close_std_{w}'] = df['close'].rolling(window=w).std()
             df[f'return_mean_{w}'] = df['return_1'].rolling(window=w).mean()
@@ -116,18 +121,28 @@ class DataProcessor():
         df['range_pct'] = df['range_cur'] / df['close']
 
         capm = CAPMAnalysis.calculate_bitcoin_capm_with_market_average(
-            start=df.index.min().strftime('%Y-%m-%dT%H:%M:%SZ'), stop=df.index.max().strftime('%Y-%m-%dT%H:%M:%SZ'))
+            start=df.index.min().strftime('%Y-%m-%dT%H:%M:%SZ'), stop=df.index.max().strftime('%Y-%m-%dT%H:%M:%SZ'), groupby_time=group_time)
 
         df = df.merge(capm, on='time', how='left')
         df.dropna(inplace=True)
 
-        df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
+        if classification:
+            df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
+            df['target'] = np.where(df['target'] > 0, 1, 0)
+            target_scaler = None
+        else:
+            df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
+            target_scaler = StandardScaler()
+            df['target'] = target_scaler.fit_transform(df[['target']])
 
-        feature_cols = [col for col in df.columns if col not in ['open','high','low','close','volume','tr','bb_mid','bb_std', 'target', 'alpha', 'risk_free_rate']]
+        feature_cols = [col for col in df.columns if col not in ['tr','bb_mid','bb_std', 'target']]
         scaler = StandardScaler()
         df[feature_cols] = scaler.fit_transform(df[feature_cols])
-        target_scaler = StandardScaler()
-        df['target'] = target_scaler.fit_transform(df[['target']])
+
+        #save scaler
+        scaler_path = f'./scalers/scaler{group_time}.pkl'
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(scaler, f)
 
         return df, scaler, feature_cols, target_scaler
 
@@ -170,48 +185,73 @@ class DataProcessor():
         return obv
 
     @classmethod
-    def select_features_boruta(cls, df, feature_cols, target_col='target',
-                               estimator=None, n_estimators='auto', max_iter=100, random_state=42):
+    def select_features_boruta(cls,
+                               df,
+                               feature_cols,
+                               target_col='target',
+                               sample_size=100000,
+                               n_estimators='auto',
+                               random_state=42,
+                               classification=False):
         """
-        Perform Boruta feature selection on provided features and target.
+        Boruta feature selection, regression vagy klaszifikáció esetén.
 
-        Inputs:
-          df           - DataFrame containing features and target
-          feature_cols - list of feature column names
-          target_col   - name of the target column
-          estimator    - sklearn estimator, default RandomForestRegressor
-          n_estimators - 'auto' or int, number of trees for the RF in Boruta
-          max_iter     - maximum iterations for Boruta
-          random_state - seed for reproducibility
-
-        Returns:
-          selected_features - list of features confirmed by Boruta
-          boruta_selector   - fitted BorutaPy object
+        :param df: pandas DataFrame
+        :param feature_cols: lista a feature oszlopnevekkel
+        :param target_col: célváltozó oszlop neve (folyamatos vagy bináris)
+        :param classification: bool, ha True → klaszifikáció (RFC), egyébként regresszió (RFR)
+        :param sample_size: max minta elemszám
+        :param n_estimators: 'auto' vagy int, a fák száma (ha 'auto', Boruta belsőleg kezeli)
+        :param max_iter: Boruta iterációk száma
+        :param random_state: seed
+        :return: (selected_features, boruta_selector)
         """
-        X = df[feature_cols].values
-        y = df[target_col].values.ravel()
+        # mintavételezés
+        sample_df = df.sample(n=sample_size, random_state=random_state) \
+            if len(df) > sample_size else df
 
-        # Default estimator
-        if estimator is None:
-            rf = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
+        X = sample_df[feature_cols].values
+        y = sample_df[target_col].values.ravel()
+
+        # modell kiválasztása
+        if classification:
+            estimator = RandomForestClassifier(
+                n_estimators=1000,
+                random_state=random_state,
+                n_jobs=-1,
+                max_depth = 6,
+                class_weight = 'balanced',
+            )
         else:
-            rf = estimator
+            estimator = RandomForestRegressor(
+                n_estimators='200',
+                random_state=random_state,
+                n_jobs=-1
+            )
 
-        # Initialize Boruta
+        # Boruta selector létrehozása
         boruta_selector = BorutaPy(
-            estimator=rf,
-            n_estimators=n_estimators,
-            max_iter=max_iter,
+            estimator=estimator,
             random_state=random_state,
-            verbose=2
+            n_estimators=n_estimators,
+            verbose=2,
+            alpha=0.05,
+            perc= 90
         )
-
-        # Run Boruta
         boruta_selector.fit(X, y)
 
-        # Extract selected features
-        selected_mask = boruta_selector.support_
-        selected_features = [f for f, keep in zip(feature_cols, selected_mask) if keep]
+        # eredmények kiírása
+        print("\n------ Feature Selection Results ------\n")
+        results = pd.DataFrame({
+            'Feature': feature_cols,
+            'Support': boruta_selector.support_,
+            'Ranking': boruta_selector.ranking_
+        })
+        results = results.sort_values(by=['Support', 'Ranking'], ascending=[False, True])
+        print(results.to_string(index=False))
+
+        selected_features = results.loc[results['Support'], 'Feature'].tolist()
+        print(f"\nSelected features ({'classification' if classification else 'regression'}):",
+              selected_features)
 
         return selected_features, boruta_selector
-

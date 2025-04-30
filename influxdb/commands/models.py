@@ -23,7 +23,7 @@ class LSTMModel:
     The model is designed to predict future values in time series data based on historical patterns.
     """
 
-    def __init__(self, input_shape, output_steps, activation='linear'):
+    def __init__(self, input_shape, output_steps, classification=False):
         """
         Initializes the LSTM model.
 
@@ -36,10 +36,10 @@ class LSTMModel:
         self.model = self._build_model(
             input_shape, 
             output_steps,
-            activation
+            classification
         )
 
-    def _build_model(self, input_shape, output_steps, activation):
+    def _build_model(self, input_shape, output_steps, classification):
         """
         Build a more complex LSTM model with multiple layers and regularization.
 
@@ -54,26 +54,32 @@ class LSTMModel:
         model = Sequential()
         model.add(Input(shape=input_shape))
 
-        model.add(Conv1D(filters=32, kernel_size=3, activation='relu', padding='same'))
-        model.add(MaxPooling1D(pool_size=2))
+        model.add(Conv1D(filters=64, kernel_size=3, activation='relu', padding='same'))
         model.add(BatchNormalization())
-        model.add(Dropout(0.2))
+        model.add(MaxPooling1D(pool_size=1))
+        model.add(Dropout(0.5))
 
         model.add(LSTM(128, return_sequences=True, recurrent_dropout=0.2))
         model.add(BatchNormalization())
-        model.add(Dropout(0.2))
+        model.add(Dropout(0.5))
 
-        model.add(LSTM(64, return_sequences=False, recurrent_dropout=0.2))
+        model.add(LSTM(80, return_sequences=False, recurrent_dropout=0.2))
         model.add(BatchNormalization())
-        model.add(Dropout(0.2))
+        model.add(Dropout(0.5))
 
-        model.add(Dense(32, activation='tanh'))
-        model.add(Dropout(0.1))
-        model.add(Dense(output_steps, activation='linear'))
-        model.add(Reshape((output_steps, 1)))  # output: (batch, output_steps, 1)
-
-        model.compile(optimizer='adam', loss=weighted_directional_mae(alpha=5.0), metrics=['mse', directional_accuracy])
+        if classification:
+            model.add(Dense(output_steps, activation='sigmoid'))
+            model.compile(
+                optimizer='adam',
+                loss='binary_crossentropy',
+                metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
+            )
+        else:
+            model.add(Dense(output_steps, activation='linear'))
+            model.add(Reshape((output_steps, 1)))  # output: (batch, output_steps, 1)
+            model.compile(optimizer='adam', loss=weighted_directional_mae(alpha=5.0),metrics=['mse', directional_accuracy])
         model.summary()
+
         return model
 
     def fit(self, X_train, y_train, X_val, y_val, epochs=200, batch_size=128, patience=10):
@@ -93,7 +99,7 @@ class LSTMModel:
 
         reduce_lr = ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.5,
+            factor=0.25,
             patience=5,
             min_lr=1e-6,
             verbose=1
@@ -125,7 +131,7 @@ class LSTMModel:
         print("Training finished.")
         return history
 
-    def predict(self, data):
+    def predict(self, data, classification=False):
         """
         Predict future values using the LSTM model.
 
@@ -136,9 +142,12 @@ class LSTMModel:
             ndarray: Predicted values of shape (samples, output_steps)
         """
         # Get predictions from the model
-        predictions = self.model.predict(data)
-
-        return predictions
+        if classification:
+            probs = self.model.predict(data)
+            return (probs >= 0.5).astype(int)
+        else:
+            predictions = self.model.predict(data)
+            return predictions
 
     def evaluate(self, X_test, y_test):
         """

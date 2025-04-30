@@ -51,6 +51,30 @@ class InfluxDBQueries():
                   |> filter(fn: (r) => r["_measurement"] == "crypto" and r["_field"] == "close" and r["pair"] == "{pair}")
                   |> aggregateWindow(every: {groupby_time}, fn: last, createEmpty: false)
                   |> yield(name: "close")
+                  
+                from(bucket: "{bucket}")
+                  |> range(start: {start_dt.isoformat()}, stop: {chunk_stop_dt.isoformat()})
+                  |> filter(fn: (r) => r["_measurement"] == "crypto" and r["_field"] == "quote_volume" and r["pair"] == "{pair}")
+                  |> aggregateWindow(every: {groupby_time}, fn: sum, createEmpty: false)
+                  |> yield(name: "quote_volume")
+                
+                from(bucket: "{bucket}")
+                  |> range(start: {start_dt.isoformat()}, stop: {chunk_stop_dt.isoformat()})
+                  |> filter(fn: (r) => r["_measurement"] == "crypto" and r["_field"] == "trades" and r["pair"] == "{pair}")
+                  |> aggregateWindow(every: {groupby_time}, fn: sum, createEmpty: false)
+                  |> yield(name: "trades")
+                  
+                from(bucket: "{bucket}")
+                  |> range(start: {start_dt.isoformat()}, stop: {chunk_stop_dt.isoformat()})
+                  |> filter(fn: (r) => r["_measurement"] == "crypto" and r["_field"] == "tb_base" and r["pair"] == "{pair}")
+                  |> aggregateWindow(every: {groupby_time}, fn: sum, createEmpty: false)
+                  |> yield(name: "tb_base")
+                  
+                from(bucket: "{bucket}")
+                  |> range(start: {start_dt.isoformat()}, stop: {chunk_stop_dt.isoformat()})
+                  |> filter(fn: (r) => r["_measurement"] == "crypto" and r["_field"] == "tb_quote" and r["pair"] == "{pair}")
+                  |> aggregateWindow(every: {groupby_time}, fn: sum, createEmpty: false)
+                  |> yield(name: "tb_quote")
 
                 from(bucket: "{bucket}")
                   |> range(start: {start_dt.isoformat()}, stop: {chunk_stop_dt.isoformat()})
