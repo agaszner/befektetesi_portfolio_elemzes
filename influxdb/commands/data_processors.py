@@ -216,10 +216,10 @@ class DataProcessor():
         # modell kiválasztása
         if classification:
             estimator = RandomForestClassifier(
-                n_estimators=1000,
+                n_estimators=100,
                 random_state=random_state,
                 n_jobs=-1,
-                max_depth = 6,
+                max_depth = 3,
                 class_weight = 'balanced',
             )
         else:
@@ -236,7 +236,8 @@ class DataProcessor():
             n_estimators=n_estimators,
             verbose=2,
             alpha=0.05,
-            perc= 90
+            perc= 30,
+            max_iter=200,
         )
         boruta_selector.fit(X, y)
 
