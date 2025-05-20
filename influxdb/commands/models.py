@@ -5,8 +5,9 @@ import datetime
 import pickle
 from tensorflow.keras import Input
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Bidirectional, Reshape, Conv1D, MaxPooling1D
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Bidirectional, Reshape, Conv1D, AvgPool1D
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, TensorBoard
+
 
 class LSTMModel:
     """
@@ -56,7 +57,7 @@ class LSTMModel:
 
         model.add(Conv1D(filters=64, kernel_size=3, activation='relu', padding='same'))
         model.add(BatchNormalization())
-        model.add(MaxPooling1D(pool_size=1))
+        model.add(AvgPool1D(pool_size=1))
         model.add(Dropout(0.5))
 
         model.add(LSTM(128, return_sequences=True, recurrent_dropout=0.2))

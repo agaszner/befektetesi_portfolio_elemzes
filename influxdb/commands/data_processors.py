@@ -60,7 +60,7 @@ class DataProcessor():
         return X_array, y_array
 
     @classmethod
-    def add_features(cls, df, classification=False, group_time='5m'):
+    def add_features(cls, df, classification=False, group_time='5m', scaler=None, boruta_columns=None, target_shift=1):
         """
         Input:
           df indexed by 5‑min timestamps, columns: ['open','high','low','close','volume']
@@ -122,12 +122,12 @@ class DataProcessor():
 
         capm = CAPMAnalysis.calculate_bitcoin_capm_with_market_average(
             start=df.index.min().strftime('%Y-%m-%dT%H:%M:%SZ'), stop=df.index.max().strftime('%Y-%m-%dT%H:%M:%SZ'), groupby_time=group_time)
-
+        df['close_moving_avg'] = df['close'].rolling(window=6).mean()
         df = df.merge(capm, on='time', how='left')
         df.dropna(inplace=True)
 
         if classification:
-            df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
+            df['target'] = (df['close_moving_avg'].shift(-target_shift) - df['close']) / df['close']
             df['target'] = np.where(df['target'] > 0, 1, 0)
             target_scaler = None
         else:
@@ -136,13 +136,17 @@ class DataProcessor():
             df['target'] = target_scaler.fit_transform(df[['target']])
 
         feature_cols = [col for col in df.columns if col not in ['tr','bb_mid','bb_std', 'target']]
-        scaler = StandardScaler()
-        df[feature_cols] = scaler.fit_transform(df[feature_cols])
+        if scaler is None:
+            scaler = StandardScaler()
+            df[feature_cols] = scaler.fit_transform(df[feature_cols])
 
-        #save scaler
-        scaler_path = f'./scalers/scaler{group_time}.pkl'
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(scaler, f)
+            #save scaler
+            scaler_path = f'./scalers/scaler{group_time}.pkl'
+            with open(scaler_path, 'wb') as f:
+                pickle.dump(scaler, f)
+        else:
+            print(df.columns)
+            df.loc[:, scaler.feature_names_in_] = scaler.transform(df.loc[:, scaler.feature_names_in_])
 
         return df, scaler, feature_cols, target_scaler
 
@@ -216,10 +220,10 @@ class DataProcessor():
         # modell kiválasztása
         if classification:
             estimator = RandomForestClassifier(
-                n_estimators=100,
+                n_estimators=1500,
                 random_state=random_state,
                 n_jobs=-1,
-                max_depth = 3,
+                max_depth = 7,
                 class_weight = 'balanced',
             )
         else:
@@ -236,8 +240,8 @@ class DataProcessor():
             n_estimators=n_estimators,
             verbose=2,
             alpha=0.05,
-            perc= 30,
-            max_iter=200,
+            perc= 100,
+            max_iter=100,
         )
         boruta_selector.fit(X, y)
 
